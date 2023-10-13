@@ -15,4 +15,5 @@ __pycache__/
 
 # Default build and log directories
 bd*/
+build_*/
 logs/
