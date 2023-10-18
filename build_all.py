@@ -432,7 +432,7 @@ def set_environ():
         os.environ[key] = gp['env'][key]
 
 
-def compile_file(f_root, srcdir, bindir, suffix='.c'):
+def compile_file(f_root, srcdir, bindir, suffix='.c', compile_support = False):
     """Compile a single C or assembler file, with the given file root, "f_root",
        suffix "suffix", from the source directory, "srcdir", in to the bin
        directory, "bindir" using the general preprocessor and C compilation
@@ -445,11 +445,12 @@ def compile_file(f_root, srcdir, bindir, suffix='.c'):
     abs_src = os.path.join(srcdir, '{root}{suff}'.format(root=f_root, suff=suffix))
     abs_bin = os.path.join(bindir, '{root}.o'.format(root=f_root))
 
-    # Construct the argument list
-    arglist = [gp["cc"]]
-    arglist.extend(gp['cflags'])
-    arglist.extend(gp['cc_output_pattern'].format('{root}.o'.format(root=f_root)).split())
-    arglist.extend(gp['cc_input_pattern'].format(abs_src).split())
+    # get build command pipeline
+    if "pipeline" in gp and not compile_support:
+        cmdpipe = gp["pipeline"]
+        steps = len(cmdpipe)
+    else:
+        steps = 1
 
     # Run the compilation, but only if the source file is newer than the
     # binary.
@@ -459,37 +460,81 @@ def compile_file(f_root, srcdir, bindir, suffix='.c'):
     if not os.path.isfile(abs_bin) or (
             os.path.getmtime(abs_src) > os.path.getmtime(abs_bin)
     ):
-        if gp['verbose']:
-            log.debug('Compiling in directory {bin}'.format(bin=bindir))
-            log.debug(arglist_to_str(arglist))
+        for i in range(steps):
+            # Construct the argument list
+            if "pipeline" not in gp or compile_support:
+                arglist = [gp["cc"]]
+                arglist.extend(gp['cflags'])
+                arglist.extend(gp['cc_output_pattern'].format('{root}.o'.format(root=f_root)).split())
+                arglist.extend(gp['cc_input_pattern'].format(abs_src).split())
+            else:
+                arglist = cmdpipe[i].split(" ")
+                if arglist[0] == "clang":
+                    arglist.extend(gp['cflags'])
+                if i == 0:
+                    arglist.append("-o")
+                    arglist.append(f"{f_root}.step{i+1}.ll")
+                    arglist.append(f"{abs_src}")
+                elif i == steps - 1:
+                    arglist.append("-o")
+                    arglist.append(f"{f_root}.o")
+                    arglist.append(f"{f_root}.step{i}.ll")
+                else:
+                    arglist.append("-o")
+                    arglist.append(f"{f_root}.step{i+1}.ll")
+                    arglist.append(f"{f_root}.step{i}.ll")
 
-        try:
-            res = subprocess.run(
-                arglist,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=bindir,
-                timeout=gp['timeout'],
-            )
-            if res.returncode != 0:
+            if gp['verbose']:
+                log.debug('Compiling in directory {bin}'.format(bin=bindir))
+                log.debug(arglist_to_str(arglist))
+
+            # only support loading one plugin at a time
+            if '-load-pass-plugin' in arglist:
+                idx = arglist.index('-load-pass-plugin') + 1
+                plugin_name = arglist[idx]
+                plugin_dirs = gp['pass_plugin_dirs'] # relative to this script
+                for dir in plugin_dirs:
+                    so_files = filter(
+                        lambda f: f.endswith(".so"),
+                        os.listdir(dir)
+                    )
+                    if plugin_name in so_files:
+                        arglist[idx] = os.path.abspath(
+                            os.path.join(
+                                os.path.dirname(__file__),
+                                dir, plugin_name
+                            )
+                        )
+                        break
+
+            try:
+                res = subprocess.run(
+                    arglist,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=bindir,
+                    timeout=gp['timeout'],
+                )
+                if res.returncode != 0:
+                    log.warning(
+                        'Warning: Compilation of {root}{suff} from source directory {src} to binary directory {bin} failed'
+                            .format(root=f_root, suff=suffix, src=srcdir, bin=bindir)
+                    )
+                    succeeded = False
+            except subprocess.TimeoutExpired:
                 log.warning(
-                    'Warning: Compilation of {root}{suff} from source directory {src} to binary directory {bin} failed'
+                    'Warning: Compilation of {root}{suff} from source directory {src} to binary directory {bin} timed out'
                         .format(root=f_root, suff=suffix, src=srcdir, bin=bindir)
                 )
                 succeeded = False
-        except subprocess.TimeoutExpired:
-            log.warning(
-                'Warning: Compilation of {root}{suff} from source directory {src} to binary directory {bin} timed out'
-                    .format(root=f_root, suff=suffix, src=srcdir, bin=bindir)
-            )
-            succeeded = False
 
-        if not succeeded:
-            log.debug('Command was:')
-            log.debug(arglist_to_str(arglist))
+            if not succeeded:
+                log.debug('Command was:')
+                log.debug(arglist_to_str(arglist))
 
-            log.debug(res.stdout.decode('utf-8'))
-            log.debug(res.stderr.decode('utf-8'))
+                log.debug(res.stdout.decode('utf-8'))
+                log.debug(res.stderr.decode('utf-8'))
+                break
 
     return succeeded
 
@@ -537,13 +582,13 @@ def compile_support():
             return False
 
     # Compile each general support file in the benchmark
-    succeeded &= compile_file('beebsc', gp['supportdir'], gp['bd_supportdir'])
-    succeeded &= compile_file('main', gp['supportdir'], gp['bd_supportdir'])
+    succeeded &= compile_file('beebsc', gp['supportdir'], gp['bd_supportdir'], compile_support=True)
+    succeeded &= compile_file('main', gp['supportdir'], gp['bd_supportdir'], compile_support=True)
 
     # Compile dummy files that are needed
     for dlib in gp['dummy_libs']:
         succeeded &= compile_file(
-            'dummy-' + dlib, gp['supportdir'], gp['bd_supportdir']
+            'dummy-' + dlib, gp['supportdir'], gp['bd_supportdir'], compile_support=True
         )
 
     # Compile architecture, chip and board specific files.  Note that we only
@@ -570,7 +615,7 @@ def compile_support():
                         )
                         return False
 
-                succeeded &= compile_file(root, dirname, builddir, suffix=ext)
+                succeeded &= compile_file(root, dirname, builddir, suffix=ext, compile_support=True)
 
     return succeeded
 
